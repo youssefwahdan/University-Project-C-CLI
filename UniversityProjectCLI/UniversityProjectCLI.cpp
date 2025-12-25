@@ -1,778 +1,1128 @@
 #include <iostream>
+#include <sqlite3.h>
 #include <string>
 #include <vector>
-#include <memory>
+#include <map>
+#include <algorithm>
+#include <cctype>
 #include <iomanip>
-#include <sqlite3.h>
-#include <optional>
-
+#include <sstream>
+#include <ctime>
 
 using namespace std;
 
+// Global database connection
+sqlite3* db;
 
-/* ---------------------------
-   Utility RAII wrappers
-   --------------------------- */
-struct DB {
-    sqlite3* db = nullptr;
-    DB(const string& path) {
-        if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
-            cerr << "Cannot open DB: " << sqlite3_errmsg(db) << "\n";
-            sqlite3_close(db); db = nullptr;
-            throw runtime_error("DB open failed");
-        }
-        // enable foreign keys
-        sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
+// Helper function to execute SQL queries
+bool executeSQL(const char* sql) {
+    char* errMsg = 0;
+    int rc = sqlite3_exec(db, sql, 0, 0, &errMsg);
+    if (rc != SQLITE_OK) {
+        cerr << "SQL error: " << errMsg << endl;
+        sqlite3_free(errMsg);
+        return false;
     }
-    ~DB() { if (db) sqlite3_close(db); }
-};
+    return true;
+}
 
-struct Stmt {
-    sqlite3_stmt* stmt = nullptr;
-    Stmt(sqlite3* db, const string& sql) {
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-            throw runtime_error(string("Prepare failed: ") + sqlite3_errmsg(db));
-        }
-    }
-    ~Stmt() { if (stmt) sqlite3_finalize(stmt); }
-    // convenience
-    void reset() { if (stmt) sqlite3_reset(stmt); }
-};
-
-/* ---------------------------
-   Domain models
-   --------------------------- */
-struct UserModel {
-    int id = -1;
+// User base class
+class User {
+protected:
+    int id;
     string username;
+    string password;
     string name;
+    string email;
     string role;
-};
-
-struct StudentModel {
-    int id = -1;
-    int user_id = -1;
-    string major;
-    int year = 0;
-};
-
-struct CourseModel {
-    int id = -1;
-    string code;
-    string title;
-    int professor_id = -1;
-};
-
-struct FeeModel {
-    int id = -1;
-    int student_id = -1;
-    double amount = 0.0;
-    bool paid = false;
-};
-
-struct AttendanceModel {
-    int id = -1;
-    int course_id = -1;
-    int student_id = -1;
-    bool present = false;
-};
-
-struct GradeModel {
-    int id = -1;
-    int course_id = -1;
-    int student_id = -1;
-    double grade = 0.0;
-};
-
-/* ---------------------------
-   Repositories (DAO)
-   --------------------------- */
-class UserRepo {
-    sqlite3* db;
 public:
-    UserRepo(sqlite3* db_) : db(db_) {}
-    sqlite3* get_db() const { return db; }
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT, name TEXT);";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
+    User(int id, string username, string password, string name, string email, string role)
+        : id(id), username(username), password(password), name(name), email(email), role(role) {
     }
-    void seed_accounts() {
-        const char* sql = "INSERT OR IGNORE INTO users(username,password,role,name) VALUES"
-            "('admin','admin','admin','System Admin'),"
-            "('prof_john','pass123','professor','John Smith'),"
-            "('student_ali','s123','student','Ali Hassan');";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    optional<UserModel> find_by_credentials(const string& username, const string& password) {
-        const char* sql = "SELECT id,username,name,role FROM users WHERE username=? AND password=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_text(s.stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.stmt, 2, password.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            UserModel u;
-            u.id = sqlite3_column_int(s.stmt, 0);
-            u.username = (const char*)sqlite3_column_text(s.stmt, 1);
-            u.name = (const char*)sqlite3_column_text(s.stmt, 2);
-            u.role = (const char*)sqlite3_column_text(s.stmt, 3);
-            return u;
-        }
-        return nullopt;
-    }
-    bool create_user(const string& username, const string& password, const string& role, const string& name) {
-        const char* sql = "INSERT INTO users(username,password,role,name) VALUES(?,?,?,?);";
-        Stmt s(db, sql);
-        sqlite3_bind_text(s.stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.stmt, 2, password.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.stmt, 3, role.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.stmt, 4, name.c_str(), -1, SQLITE_TRANSIENT);
-        int rc = sqlite3_step(s.stmt);
-        return rc == SQLITE_DONE;
-    }
+
+    virtual void displayMenu() = 0;
+    string getRole() const { return role; }
+    int getId() const { return id; }
+    string getName() const { return name; }
 };
 
-class StudentRepo {
-    sqlite3* db;
-public:
-    StudentRepo(sqlite3* db_) : db(db_) {}
-    sqlite3* get_db() const { return db; }
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS students(id INTEGER PRIMARY KEY, user_id INTEGER UNIQUE, major TEXT, year INTEGER, FOREIGN KEY(user_id) REFERENCES users(id));";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    void ensure_student_for_username(const string& username, const string& major = "Undeclared", int year = 1) {
-        const char* sql =
-            "INSERT OR IGNORE INTO students(user_id,major,year) "
-            "SELECT u.id,?,? FROM users u WHERE u.username=? AND NOT EXISTS(SELECT 1 FROM students s WHERE s.user_id=u.id);";
-        Stmt s(db, sql);
-        sqlite3_bind_text(s.stmt, 1, major.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(s.stmt, 2, year);
-        sqlite3_bind_text(s.stmt, 3, username.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(s.stmt);
-    }
-    vector<pair<StudentModel, UserModel>> list_all_students() {
-        const char* sql = "SELECT s.id,s.user_id,s.major,s.year,u.id,u.username,u.name FROM students s JOIN users u ON s.user_id=u.id;";
-        Stmt s(db, sql);
-        vector<pair<StudentModel, UserModel>> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            StudentModel sm; UserModel um;
-            sm.id = sqlite3_column_int(s.stmt, 0);
-            sm.user_id = sqlite3_column_int(s.stmt, 1);
-            sm.major = (const char*)sqlite3_column_text(s.stmt, 2);
-            sm.year = sqlite3_column_int(s.stmt, 3);
-            um.id = sqlite3_column_int(s.stmt, 4);
-            um.username = (const char*)sqlite3_column_text(s.stmt, 5);
-            um.name = (const char*)sqlite3_column_text(s.stmt, 6);
-            out.push_back({ sm, um });
-        }
-        return out;
-    }
-    optional<StudentModel> find_by_user_id(int user_id) {
-        const char* sql = "SELECT id,user_id,major,year FROM students WHERE user_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, user_id);
-        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            StudentModel sm;
-            sm.id = sqlite3_column_int(s.stmt, 0);
-            sm.user_id = sqlite3_column_int(s.stmt, 1);
-            sm.major = (const char*)sqlite3_column_text(s.stmt, 2);
-            sm.year = sqlite3_column_int(s.stmt, 3);
-            return sm;
-        }
-        return nullopt;
-    }
-    optional<StudentModel> find_by_id(int id) {
-        const char* sql = "SELECT id,user_id,major,year FROM students WHERE id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, id);
-        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            StudentModel sm;
-            sm.id = sqlite3_column_int(s.stmt, 0);
-            sm.user_id = sqlite3_column_int(s.stmt, 1);
-            sm.major = (const char*)sqlite3_column_text(s.stmt, 2);
-            sm.year = sqlite3_column_int(s.stmt, 3);
-            return sm;
-        }
-        return nullopt;
-    }
-    int create_student_for_user(int user_id, const string& major, int year) {
-        const char* sql = "INSERT INTO students(user_id,major,year) VALUES(?,?,?);";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, user_id);
-        sqlite3_bind_text(s.stmt, 2, major.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(s.stmt, 3, year);
-        sqlite3_step(s.stmt);
-        return (int)sqlite3_last_insert_rowid(db);
-    }
-};
-
-class CourseRepo {
-    sqlite3* db;
-public:
-    CourseRepo(sqlite3* db_) : db(db_) {}
-    sqlite3* get_db() const { return db; }
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS courses(id INTEGER PRIMARY KEY, code TEXT, title TEXT, professor_id INTEGER, FOREIGN KEY(professor_id) REFERENCES users(id));";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    vector<CourseModel> list_by_professor(int prof_id) {
-        const char* sql = "SELECT id,code,title,professor_id FROM courses WHERE professor_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, prof_id);
-        vector<CourseModel> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            CourseModel c;
-            c.id = sqlite3_column_int(s.stmt, 0);
-            c.code = (const char*)sqlite3_column_text(s.stmt, 1);
-            c.title = (const char*)sqlite3_column_text(s.stmt, 2);
-            c.professor_id = sqlite3_column_int(s.stmt, 3);
-            out.push_back(c);
-        }
-        return out;
-    }
-    vector<CourseModel> list_all() {
-        const char* sql = "SELECT id,code,title,professor_id FROM courses;";
-        Stmt s(db, sql);
-        vector<CourseModel> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            CourseModel c;
-            c.id = sqlite3_column_int(s.stmt, 0);
-            c.code = (const char*)sqlite3_column_text(s.stmt, 1);
-            c.title = (const char*)sqlite3_column_text(s.stmt, 2);
-            c.professor_id = sqlite3_column_int(s.stmt, 3);
-            out.push_back(c);
-        }
-        return out;
-    }
-    int create_course(const string& code, const string& title, int prof_id) {
-        const char* sql = "INSERT INTO courses(code,title,professor_id) VALUES(?,?,?);";
-        Stmt s(db, sql);
-        sqlite3_bind_text(s.stmt, 1, code.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s.stmt, 2, title.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(s.stmt, 3, prof_id);
-        sqlite3_step(s.stmt);
-        return (int)sqlite3_last_insert_rowid(db);
-    }
-};
-
-class FeeRepo {
-    sqlite3* db;
-public:
-    FeeRepo(sqlite3* db_) : db(db_) {}
-    sqlite3* get_db() const { return db; }
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS fees(id INTEGER PRIMARY KEY, student_id INTEGER, amount REAL, paid INTEGER, FOREIGN KEY(student_id) REFERENCES students(id));";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    void add_fee(int student_id, double amount, bool paid) {
-        const char* sql = "INSERT INTO fees(student_id,amount,paid) VALUES(?,?,?);";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, student_id);
-        sqlite3_bind_double(s.stmt, 2, amount);
-        sqlite3_bind_int(s.stmt, 3, paid ? 1 : 0);
-        sqlite3_step(s.stmt);
-    }
-    vector<FeeModel> list_by_student(int student_id) {
-        const char* sql = "SELECT id,student_id,amount,paid FROM fees WHERE student_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, student_id);
-        vector<FeeModel> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            FeeModel f;
-            f.id = sqlite3_column_int(s.stmt, 0);
-            f.student_id = sqlite3_column_int(s.stmt, 1);
-            f.amount = sqlite3_column_double(s.stmt, 2);
-            f.paid = sqlite3_column_int(s.stmt, 3) != 0;
-            out.push_back(f);
-        }
-        return out;
-    }
-};
-
-class AttendanceRepo {
-    sqlite3* db;
-public:
-    AttendanceRepo(sqlite3* db_) : db(db_) {}
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY, course_id INTEGER, student_id INTEGER, present INTEGER, "
-            "FOREIGN KEY(course_id) REFERENCES courses(id), FOREIGN KEY(student_id) REFERENCES students(id));";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    vector<AttendanceModel> list_for_course(int course_id) {
-        const char* sql = "SELECT id,course_id,student_id,present FROM attendance WHERE course_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, course_id);
-        vector<AttendanceModel> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            AttendanceModel a;
-            a.id = sqlite3_column_int(s.stmt, 0);
-            a.course_id = sqlite3_column_int(s.stmt, 1);
-            a.student_id = sqlite3_column_int(s.stmt, 2);
-            a.present = sqlite3_column_int(s.stmt, 3) != 0;
-            out.push_back(a);
-        }
-        return out;
-    }
-    void set_attendance(int course_id, int student_id, bool present) {
-        // delete existing then insert (portable)
-        const char* del = "DELETE FROM attendance WHERE course_id=? AND student_id=?;";
-        Stmt sd(db, del);
-        sqlite3_bind_int(sd.stmt, 1, course_id);
-        sqlite3_bind_int(sd.stmt, 2, student_id);
-        sqlite3_step(sd.stmt);
-        const char* ins = "INSERT INTO attendance(course_id,student_id,present) VALUES(?,?,?);";
-        Stmt si(db, ins);
-        sqlite3_bind_int(si.stmt, 1, course_id);
-        sqlite3_bind_int(si.stmt, 2, student_id);
-        sqlite3_bind_int(si.stmt, 3, present ? 1 : 0);
-        sqlite3_step(si.stmt);
-    }
-    optional<AttendanceModel> find(int course_id, int student_id) {
-        const char* sql = "SELECT id,course_id,student_id,present FROM attendance WHERE course_id=? AND student_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, course_id);
-        sqlite3_bind_int(s.stmt, 2, student_id);
-        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            AttendanceModel a;
-            a.id = sqlite3_column_int(s.stmt, 0);
-            a.course_id = sqlite3_column_int(s.stmt, 1);
-            a.student_id = sqlite3_column_int(s.stmt, 2);
-            a.present = sqlite3_column_int(s.stmt, 3) != 0;
-            return a;
-        }
-        return nullopt;
-    }
-};
-
-class GradeRepo {
-    sqlite3* db;
-public:
-    GradeRepo(sqlite3* db_) : db(db_) {}
-    sqlite3* get_db() const { return db; }
-    void init_schema() {
-        const char* sql =
-            "CREATE TABLE IF NOT EXISTS grades(id INTEGER PRIMARY KEY, course_id INTEGER, student_id INTEGER, grade REAL, "
-            "FOREIGN KEY(course_id) REFERENCES courses(id), FOREIGN KEY(student_id) REFERENCES students(id));";
-        char* err = nullptr;
-        sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-    }
-    void set_grade(int course_id, int student_id, double grade) {
-        const char* del = "DELETE FROM grades WHERE course_id=? AND student_id=?;";
-        Stmt sd(db, del);
-        sqlite3_bind_int(sd.stmt, 1, course_id);
-        sqlite3_bind_int(sd.stmt, 2, student_id);
-        sqlite3_step(sd.stmt);
-        const char* ins = "INSERT INTO grades(course_id,student_id,grade) VALUES(?,?,?);";
-        Stmt si(db, ins);
-        sqlite3_bind_int(si.stmt, 1, course_id);
-        sqlite3_bind_int(si.stmt, 2, student_id);
-        sqlite3_bind_double(si.stmt, 3, grade);
-        sqlite3_step(si.stmt);
-    }
-    vector<GradeModel> list_for_course(int course_id) {
-        const char* sql = "SELECT id,course_id,student_id,grade FROM grades WHERE course_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, course_id);
-        vector<GradeModel> out;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            GradeModel g;
-            g.id = sqlite3_column_int(s.stmt, 0);
-            g.course_id = sqlite3_column_int(s.stmt, 1);
-            g.student_id = sqlite3_column_int(s.stmt, 2);
-            g.grade = sqlite3_column_double(s.stmt, 3);
-            out.push_back(g);
-        }
-        return out;
-    }
-    double average_for_student(int student_id) {
-        const char* sql = "SELECT AVG(grade) FROM grades WHERE student_id=?;";
-        Stmt s(db, sql);
-        sqlite3_bind_int(s.stmt, 1, student_id);
-        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            if (sqlite3_column_type(s.stmt, 0) == SQLITE_NULL) return -1.0;
-            return sqlite3_column_double(s.stmt, 0);
-        }
-        return -1.0;
-    }
-};
-
-/* ---------------------------
-   Services
-   --------------------------- */
-class AuthService {
-    UserRepo& userRepo;
-public:
-    AuthService(UserRepo& ur) : userRepo(ur) {}
-    optional<UserModel> login(const string& username, const string& password) {
-        return userRepo.find_by_credentials(username, password);
-    }
-};
-
-class AdminService {
-    UserRepo& userRepo;
-    StudentRepo& studentRepo;
-    FeeRepo& feeRepo;
-public:
-    AdminService(UserRepo& u, StudentRepo& s, FeeRepo& f) : userRepo(u), studentRepo(s), feeRepo(f) {}
-    void create_user(const string& username, const string& password, const string& role, const string& name) {
-        if (!userRepo.create_user(username, password, role, name)) {
-            cout << "Failed to create user (maybe username exists)\n";
-            return;
-        }
-        if (role == "student") {
-            // create student record
-            // find user id
-            // simple query:
-            const char* sql = "SELECT id FROM users WHERE username=?;";
-            Stmt st(userRepo.get_db(), sql);
-            sqlite3_bind_text(st.stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st.stmt) == SQLITE_ROW) {
-                int uid = sqlite3_column_int(st.stmt, 0);
-                studentRepo.create_student_for_user(uid, "Undeclared", 1);
-            }
-        }
-        cout << "User created\n";
-    }
-    void list_students() {
-        auto list = studentRepo.list_all_students();
-        cout << left << setw(6) << "SID" << setw(15) << "Username" << setw(25) << "Name" << setw(15) << "Major" << setw(6) << "Year" << "\n";
-        for (auto& p : list) {
-            cout << setw(6) << p.first.id << setw(15) << p.second.username << setw(25) << p.second.name << setw(15) << p.first.major << setw(6) << p.first.year << "\n";
-        }
-    }
-    void add_fee(int student_id, double amount, bool paid) {
-        feeRepo.add_fee(student_id, amount, paid);
-        cout << "Fee added\n";
-    }
-};
-
-class ProfessorService {
-    CourseRepo& courseRepo;
-    AttendanceRepo& attendanceRepo;
-    GradeRepo& gradeRepo;
-    StudentRepo& studentRepo;
-public:
-    ProfessorService(CourseRepo& c, AttendanceRepo& a, GradeRepo& g, StudentRepo& s)
-        : courseRepo(c), attendanceRepo(a), gradeRepo(g), studentRepo(s) {
-    }
-    void list_courses(int prof_id) {
-        auto courses = courseRepo.list_by_professor(prof_id);
-        cout << "Courses:\n";
-        for (auto& c : courses) {
-            cout << c.id << " | " << c.code << " - " << c.title << "\n";
-        }
-    }
-    void add_course(int prof_id, const string& code, const string& title) {
-        courseRepo.create_course(code, title, prof_id);
-        cout << "Course added\n";
-    }
-    void manage_attendance(int course_id) {
-        // list students
-        const char* sql = "SELECT s.id,u.name FROM students s JOIN users u ON s.user_id=u.id;";
-        Stmt s(courseRepo.get_db(), sql);
-        vector<pair<int, string>> studs;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            studs.push_back({ sqlite3_column_int(s.stmt,0), (const char*)sqlite3_column_text(s.stmt,1) });
-        }
-        cout << left << setw(6) << "SID" << setw(25) << "Name" << setw(8) << "Present\n";
-        for (auto& st : studs) {
-            auto a = attendanceRepo.find(course_id, st.first);
-            cout << setw(6) << st.first << setw(25) << st.second << setw(8) << (a && a->present ? 1 : 0) << "\n";
-        }
-        cout << "Enter student id to toggle/set (0 to back): ";
-        int sid; cin >> sid;
-        if (sid == 0) return;
-        cout << "Present? 1=yes 0=no: "; int p; cin >> p;
-        attendanceRepo.set_attendance(course_id, sid, p == 1);
-        cout << "Attendance updated\n";
-    }
-    void manage_grades(int course_id) {
-        // list students
-        const char* sql = "SELECT s.id,u.name FROM students s JOIN users u ON s.user_id=u.id;";
-        Stmt s(courseRepo.get_db(), sql);
-        vector<pair<int, string>> studs;
-        while (sqlite3_step(s.stmt) == SQLITE_ROW) {
-            studs.push_back({ sqlite3_column_int(s.stmt,0), (const char*)sqlite3_column_text(s.stmt,1) });
-        }
-        cout << left << setw(6) << "SID" << setw(25) << "Name" << setw(8) << "Grade\n";
-        for (auto& st : studs) {
-            // try to find grade
-            const char* gsql = "SELECT grade FROM grades WHERE course_id=? AND student_id=?;";
-            Stmt gs(courseRepo.get_db(), gsql);
-            sqlite3_bind_int(gs.stmt, 1, course_id);
-            sqlite3_bind_int(gs.stmt, 2, st.first);
-            if (sqlite3_step(gs.stmt) == SQLITE_ROW) {
-                cout << setw(6) << st.first << setw(25) << st.second << setw(8) << sqlite3_column_double(gs.stmt, 0) << "\n";
-            }
-            else {
-                cout << setw(6) << st.first << setw(25) << st.second << setw(8) << "N/A" << "\n";
-            }
-        }
-        cout << "Enter student id to set grade (0 to back): ";
-        int sid; cin >> sid;
-        if (sid == 0) return;
-        cout << "Grade (0-100): "; double grade; cin >> grade;
-        gradeRepo.set_grade(course_id, sid, grade);
-        cout << "Grade saved\n";
-    }
-};
-
-class StudentService {
-    StudentRepo& studentRepo;
-    CourseRepo& courseRepo;
-    AttendanceRepo& attendanceRepo;
-    GradeRepo& gradeRepo;
-    FeeRepo& feeRepo;
-public:
-    StudentService(StudentRepo& s, CourseRepo& c, AttendanceRepo& a, GradeRepo& g, FeeRepo& f)
-        : studentRepo(s), courseRepo(c), attendanceRepo(a), gradeRepo(g), feeRepo(f) {
-    }
-    void show_profile(int user_id) {
-        auto s = studentRepo.find_by_user_id(user_id);
-        if (!s) { cout << "Student record not found\n"; return; }
-        // get username/name
-        const char* sql = "SELECT username,name FROM users WHERE id=?;";
-        Stmt st(studentRepo.get_db(), sql);
-        sqlite3_bind_int(st.stmt, 1, user_id);
-        if (sqlite3_step(st.stmt) == SQLITE_ROW) {
-            cout << "Username: " << (const char*)sqlite3_column_text(st.stmt, 0) << "\n";
-            cout << "Name: " << (const char*)sqlite3_column_text(st.stmt, 1) << "\n";
-        }
-        cout << "Major: " << s->major << "  Year: " << s->year << "\n";
-    }
-    void list_courses() {
-        auto cs = courseRepo.list_all();
-        cout << "Courses available:\n";
-        for (auto& c : cs) cout << c.id << " | " << c.code << " - " << c.title << "\n";
-    }
-    void view_attendance(int user_id) {
-        auto s = studentRepo.find_by_user_id(user_id);
-        if (!s) { cout << "Student record not found\n"; return; }
-        const char* sql = "SELECT c.code,c.title,IFNULL(a.present,0) FROM courses c LEFT JOIN attendance a ON a.course_id=c.id AND a.student_id=?;";
-        Stmt st(studentRepo.get_db(), sql);
-        sqlite3_bind_int(st.stmt, 1, s->id);
-        cout << left << setw(10) << "Code" << setw(30) << "Title" << setw(8) << "Present\n";
-        while (sqlite3_step(st.stmt) == SQLITE_ROW) {
-            cout << setw(10) << (const char*)sqlite3_column_text(st.stmt, 0)
-                << setw(30) << (const char*)sqlite3_column_text(st.stmt, 1)
-                << setw(8) << sqlite3_column_int(st.stmt, 2) << "\n";
-        }
-    }
-    void view_gpa(int user_id) {
-        auto s = studentRepo.find_by_user_id(user_id);
-        if (!s) { cout << "Student record not found\n"; return; }
-        double avg = gradeRepo.average_for_student(s->id);
-        if (avg < 0) cout << "No grades yet\n"; else cout << "GPA (avg grade): " << fixed << setprecision(2) << avg << "\n";
-    }
-    void view_fees(int user_id) {
-        auto s = studentRepo.find_by_user_id(user_id);
-        if (!s) { cout << "Student record not found\n"; return; }
-        auto fees = feeRepo.list_by_student(s->id);
-        cout << left << setw(6) << "FID" << setw(12) << "Amount" << setw(8) << "Paid\n";
-        for (auto& f : fees) cout << setw(6) << f.id << setw(12) << f.amount << setw(8) << (f.paid ? "Yes" : "No") << "\n";
-    }
-};
-
-/* ---------------------------
-   CLI / Application
-   --------------------------- */
-class App {
-    unique_ptr<DB> db;
-    unique_ptr<UserRepo> userRepo;
-    unique_ptr<StudentRepo> studentRepo;
-    unique_ptr<CourseRepo> courseRepo;
-    unique_ptr<FeeRepo> feeRepo;
-    unique_ptr<AttendanceRepo> attendanceRepo;
-    unique_ptr<GradeRepo> gradeRepo;
-
-    unique_ptr<AuthService> authService;
-    unique_ptr<AdminService> adminService;
-    unique_ptr<ProfessorService> professorService;
-    unique_ptr<StudentService> studentService;
-
-public:
-    App(const string& dbpath = "university.db") {
-        db = make_unique<DB>(dbpath);
-        userRepo = make_unique<UserRepo>(db->db);
-        studentRepo = make_unique<StudentRepo>(db->db);
-        courseRepo = make_unique<CourseRepo>(db->db);
-        feeRepo = make_unique<FeeRepo>(db->db);
-        attendanceRepo = make_unique<AttendanceRepo>(db->db);
-        gradeRepo = make_unique<GradeRepo>(db->db);
-
-        // init schemas
-        userRepo->init_schema();
-        studentRepo->init_schema();
-        courseRepo->init_schema();
-        feeRepo->init_schema();
-        attendanceRepo->init_schema();
-        gradeRepo->init_schema();
-
-        // seed
-        userRepo->seed_accounts();
-        studentRepo->ensure_student_for_username("student_ali", "Computer Science", 2);
-        // seed a course for professor
-        const char* sql = "INSERT OR IGNORE INTO courses(code,title,professor_id) "
-            "SELECT 'CS101','Intro to Programming',u.id FROM users u WHERE u.username='prof_john' AND NOT EXISTS(SELECT 1 FROM courses c WHERE c.code='CS101');";
-        char* err = nullptr;
-        sqlite3_exec(db->db, sql, nullptr, nullptr, &err);
-        if (err) { string e = err; sqlite3_free(err); throw runtime_error(e); }
-
-        // services
-        authService = make_unique<AuthService>(*userRepo);
-        adminService = make_unique<AdminService>(*userRepo, *studentRepo, *feeRepo);
-        professorService = make_unique<ProfessorService>(*courseRepo, *attendanceRepo, *gradeRepo, *studentRepo);
-        studentService = make_unique<StudentService>(*studentRepo, *courseRepo, *attendanceRepo, *gradeRepo, *feeRepo);
-    }
-
-    void run() {
-        cout << "Welcome to OOP UMS CLI\n";
-        string username, password;
-        cout << "Username: "; cin >> username;
-        cout << "Password: "; cin >> password;
-        auto userOpt = authService->login(username, password);
-        if (!userOpt) { cout << "Login failed\n"; return; }
-        UserModel user = *userOpt;
-        cout << "Hello, " << user.name << " (" << user.role << ")\n";
-        if (user.role == "admin") admin_loop(user);
-        else if (user.role == "professor") professor_loop(user);
-        else if (user.role == "student") student_loop(user);
-        else cout << "Unknown role\n";
-    }
-
+// Student class
+class Student : public User {
 private:
-    void admin_loop(const UserModel& user) {
-        while (true) {
-            cout << "\nAdmin Menu: 1)Profile 2)Students 3)Fees 4)Create User 0)Logout\nChoice: ";
-            int c; cin >> c;
-            if (c == 0) break;
-            if (c == 1) {
-                cout << "Admin Profile\nUsername: " << user.username << "\nName: " << user.name << "\n";
-            }
-            else if (c == 2) {
-                adminService->list_students();
-                cout << "1)Add student 0)Back\nChoice: "; int ch; cin >> ch;
-                if (ch == 1) {
-                    string uname, pwd, name, major; int year;
-                    cout << "Username: "; cin >> uname;
-                    cout << "Password: "; cin >> pwd;
-                    cin.ignore(); cout << "Name: "; getline(cin, name);
-                    cout << "Major: "; getline(cin, major);
-                    cout << "Year: "; cin >> year;
-                    if (userRepo->create_user(uname, pwd, "student", name)) {
-                        // create student record
-                        const char* sql = "SELECT id FROM users WHERE username=?;";
-                        Stmt s(userRepo->get_db(), sql);
-                        sqlite3_bind_text(s.stmt, 1, uname.c_str(), -1, SQLITE_TRANSIENT);
-                        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-                            int uid = sqlite3_column_int(s.stmt, 0);
-                            studentRepo->create_student_for_user(uid, major, year);
-                            cout << "Student created\n";
-                        }
-                    }
-                    else cout << "Failed to create user\n";
-                }
-            }
-            else if (c == 3) {
-                cout << "Enter student id to add fee: "; int sid; cin >> sid;
-                cout << "Amount: "; double amt; cin >> amt;
-                cout << "Paid? 1=yes 0=no: "; int p; cin >> p;
-                adminService->add_fee(sid, amt, p == 1);
-            }
-            else if (c == 4) {
-                string uname, pwd, name, role;
-                cout << "Username: "; cin >> uname;
-                cout << "Password: "; cin >> pwd;
-                cin.ignore(); cout << "Full name: "; getline(cin, name);
-                cout << "Role (admin/professor/student): "; cin >> role;
-                if (!userRepo->create_user(uname, pwd, role, name)) cout << "Create failed\n";
-                else {
-                    if (role == "student") {
-                        const char* sql = "SELECT id FROM users WHERE username=?;";
-                        Stmt s(userRepo->get_db(), sql);
-                        sqlite3_bind_text(s.stmt, 1, uname.c_str(), -1, SQLITE_TRANSIENT);
-                        if (sqlite3_step(s.stmt) == SQLITE_ROW) {
-                            int uid = sqlite3_column_int(s.stmt, 0);
-                            studentRepo->create_student_for_user(uid, "Undeclared", 1);
-                        }
-                    }
-                    cout << "User created\n";
-                }
-            }
-        }
+    int departmentId;
+    double feesDue;
+    double feesPaid;
+public:
+    Student(int id, string username, string password, string name, string email, int deptId, double due, double paid)
+        : User(id, username, password, name, email, "student"), departmentId(deptId), feesDue(due), feesPaid(paid) {
     }
 
-    void professor_loop(const UserModel& user) {
-        while (true) {
-            cout << "\nProfessor Menu: 1)Profile 2)Courses 3)Attendance 4)Grades 0)Logout\nChoice: ";
-            int c; cin >> c;
-            if (c == 0) break;
-            if (c == 1) {
-                cout << "Professor Profile\nUsername: " << user.username << "\nName: " << user.name << "\n";
-            }
-            else if (c == 2) {
-                professorService->list_courses(user.id);
-                cout << "1)Add course 0)Back\nChoice: "; int ch; cin >> ch;
-                if (ch == 1) {
-                    string code, title; cin.ignore(); cout << "Code: "; getline(cin, code); cout << "Title: "; getline(cin, title);
-                    professorService->add_course(user.id, code, title);
-                }
-            }
-            else if (c == 3) {
-                professorService->list_courses(user.id);
-                cout << "Enter course id to manage attendance (0 back): "; int cid; cin >> cid;
-                if (cid != 0) professorService->manage_attendance(cid);
-            }
-            else if (c == 4) {
-                professorService->list_courses(user.id);
-                cout << "Enter course id to manage grades (0 back): "; int cid; cin >> cid;
-                if (cid != 0) professorService->manage_grades(cid);
-            }
-        }
-    }
-
-    void student_loop(const UserModel& user) {
-        while (true) {
-            cout << "\nStudent Menu: 1)Profile 2)Courses 3)Attendance 4)GPA 5)Fees 0)Logout\nChoice: ";
-            int c; cin >> c;
-            if (c == 0) break;
-            if (c == 1) studentService->show_profile(user.id);
-            else if (c == 2) studentService->list_courses();
-            else if (c == 3) studentService->view_attendance(user.id);
-            else if (c == 4) studentService->view_gpa(user.id);
-            else if (c == 5) studentService->view_fees(user.id);
-        }
-    }
+    void displayMenu() override;
+    void showProfile();
+    void showAttendance();
+    void showFees();
+    void showGrades();
 };
 
-/* ---------------------------
-   main
-   --------------------------- */
-int main() {
-    try {
-        App app;
-        app.run();
+// Professor class
+class Professor : public User {
+private:
+    vector<int> departmentIds;
+    vector<int> courseIds;
+public:
+    Professor(int id, string username, string password, string name, string email, vector<int> depts, vector<int> courses)
+        : User(id, username, password, name, email, "professor"), departmentIds(depts), courseIds(courses) {
     }
-    catch (const exception& ex) {
-        cerr << "Fatal: " << ex.what() << "\n";
+
+    void displayMenu() override;
+    void viewProfile();
+    void addAttendance();
+    void addGrades();
+    void showStudents();
+};
+
+// Admin class
+class Admin : public User {
+public:
+    Admin(int id, string username, string password, string name, string email)
+        : User(id, username, password, name, email, "admin") {
+    }
+
+    void displayMenu() override;
+    void manageUsers();
+    void listUsers();
+    void addDepartment();
+    void showGrades();
+    void showAttendance();
+    void addCourse();
+    void assignProfessor();
+    void manageFees();
+};
+
+// Login function
+User* login() {
+    string username, password;
+    cout << "=== University Login ===\n";
+    cout << "Username: ";
+    cin >> username;
+    cout << "Password: ";
+    cin >> password;
+
+    // First get basic user info
+    string sql = "SELECT id, username, password, name, email, role, department_id "
+        "FROM users WHERE username = '" + username + "' AND password = '" + password + "';";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << endl;
+        return nullptr;
+    }
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt, 0);
+        string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        string email = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        string role = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        int deptId = sqlite3_column_int(stmt, 6);
+
+        sqlite3_finalize(stmt);
+
+        if (role == "admin") {
+            return new Admin(id, username, password, name, email);
+        }
+        else if (role == "student") {
+            // Get student-specific data
+            string studentSql = "SELECT fees_due, fees_paid FROM students WHERE user_id = " + to_string(id) + ";";
+            sqlite3_stmt* studentStmt;
+            double due = 0.0, paid = 0.0;
+
+            if (sqlite3_prepare_v2(db, studentSql.c_str(), -1, &studentStmt, 0) == SQLITE_OK &&
+                sqlite3_step(studentStmt) == SQLITE_ROW) {
+                due = sqlite3_column_double(studentStmt, 0);
+                paid = sqlite3_column_double(studentStmt, 1);
+            }
+            sqlite3_finalize(studentStmt);
+
+            return new Student(id, username, password, name, email, deptId, due, paid);
+        }
+        else if (role == "professor") {
+            vector<int> depts, courses;
+            // Get professor departments
+            string deptSql = "SELECT department_id FROM professor_departments WHERE professor_id = " + to_string(id) + ";";
+            sqlite3_stmt* deptStmt;
+            if (sqlite3_prepare_v2(db, deptSql.c_str(), -1, &deptStmt, 0) == SQLITE_OK) {
+                while (sqlite3_step(deptStmt) == SQLITE_ROW) {
+                    depts.push_back(sqlite3_column_int(deptStmt, 0));
+                }
+                sqlite3_finalize(deptStmt);
+            }
+
+            // Get professor courses
+            string courseSql = "SELECT course_id FROM professor_courses WHERE professor_id = " + to_string(id) + ";";
+            sqlite3_stmt* courseStmt;
+            if (sqlite3_prepare_v2(db, courseSql.c_str(), -1, &courseStmt, 0) == SQLITE_OK) {
+                while (sqlite3_step(courseStmt) == SQLITE_ROW) {
+                    courses.push_back(sqlite3_column_int(courseStmt, 0));
+                }
+                sqlite3_finalize(courseStmt);
+            }
+
+            return new Professor(id, username, password, name, email, depts, courses);
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    cout << "Invalid credentials!" << endl;
+    return nullptr;
+}
+
+// Student member functions
+void Student::showProfile() {
+    cout << "\n=== Student Profile ===\n";
+    cout << "Name: " << name << endl;
+    cout << "Email: " << email << endl;
+
+    // Get department name
+    string sql = "SELECT name FROM departments WHERE id = " + to_string(departmentId) + ";";
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        string deptName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        cout << "Department: " << deptName << endl;
+        cout << string(23, '-') << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Student::showAttendance() {
+    cout << "\n=== Attendance Records ===\n";
+    string sql = "SELECT courses.name, attendance.date, attendance.status "
+        "FROM attendance "
+        "JOIN courses ON attendance.course_id = courses.id "
+        "WHERE student_id = " + to_string(id) + ";";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error preparing statement: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << left << setw(20) << "Course" << setw(15) << "Date" << setw(10) << "Status" << endl;
+    cout << string(50, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string course = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        string date = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        string status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        cout << left << setw(20) << course << setw(15) << date << setw(10) << status << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Student::showFees() {
+    cout << "\n=== Fee Details ===\n";
+    cout << "Fees Due: $" << fixed << setprecision(2) << feesDue << endl;
+    cout << "Fees Paid: $" << fixed << setprecision(2) << feesPaid << endl;
+    cout << "Balance: $" << fixed << setprecision(2) << (feesDue - feesPaid) << endl;
+    cout << string(19, '-') << endl;
+}
+
+void Student::showGrades() {
+    cout << "\n=== Grade Report ===\n";
+    string sql = "SELECT courses.name, grades.assignment1, grades.assignment2, "
+        "grades.coursework, grades.final_exam, grades.total, grades.grade_letter "
+        "FROM grades "
+        "JOIN courses ON grades.course_id = courses.id "
+        "WHERE student_id = " + to_string(id) + ";";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error preparing statement: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << left << setw(15) << "Course" << setw(10) << "Ass1" << setw(10) << "Ass2"
+        << setw(10) << "CW" << setw(10) << "Final" << setw(10) << "Total" << setw(10) << "Grade" << endl;
+    cout << string(80, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string course = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        double ass1 = sqlite3_column_double(stmt, 1);
+        double ass2 = sqlite3_column_double(stmt, 2);
+        double cw = sqlite3_column_double(stmt, 3);
+        double final = sqlite3_column_double(stmt, 4);
+        double total = sqlite3_column_double(stmt, 5);
+        string grade = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+
+        cout << left << setw(15) << course << setw(10) << ass1 << setw(10) << ass2 << setw(10) << cw << setw(10) << final << setw(10) << total << setw(10) << grade << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Student::displayMenu() {
+    int choice;
+    while (true) {
+        cout << "\n=== Student Menu ===\n";
+        cout << "1. Show Profile\n";
+        cout << "2. Show Attendance\n";
+        cout << "3. Show Fees\n";
+        cout << "4. Show Grades\n";
+        cout << "5. Logout\n";
+        cout << "Enter choice: ";
+        cin >> choice;
+
+        switch (choice) {
+        case 1: showProfile(); break;
+        case 2: showAttendance(); break;
+        case 3: showFees(); break;
+        case 4: showGrades(); break;
+        case 5: return;
+        default: cout << "Invalid choice!" << endl;
+        }
+    }
+}
+
+// Professor member functions
+void Professor::viewProfile() {
+    cout << "\n=== Professor Profile ===\n";
+    cout << "Name: " << name << endl;
+    cout << "Email: " << email << endl;
+
+    // Display departments
+    cout << "Departments: ";
+    for (size_t i = 0; i < departmentIds.size(); ++i) {
+        string sql = "SELECT name FROM departments WHERE id = " + to_string(departmentIds[i]) + ";";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            cout << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            if (i < departmentIds.size() - 1) cout << ", ";
+        }
+        sqlite3_finalize(stmt);
+    }
+    cout << endl;
+
+    // Display courses
+    cout << "Courses: ";
+    for (size_t i = 0; i < courseIds.size(); ++i) {
+        string sql = "SELECT name FROM courses WHERE id = " + to_string(courseIds[i]) + ";";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            cout << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            if (i < courseIds.size() - 1) cout << ", ";
+        }
+        sqlite3_finalize(stmt);
+    }
+    cout << endl;
+}
+
+void Professor::addAttendance() {
+    if (courseIds.empty()) {
+        cout << "You have no courses assigned!" << endl;
+        return;
+    }
+
+    cout << "\n=== Add Attendance ===\n";
+    cout << "Select course:\n";
+    for (size_t i = 0; i < courseIds.size(); ++i) {
+        string sql = "SELECT name FROM courses WHERE id = " + to_string(courseIds[i]) + ";";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            cout << i + 1 << ". " << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)) << endl;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    int choice;
+    cout << "Enter choice: ";
+    cin >> choice;
+    if (choice < 1 || choice > static_cast<int>(courseIds.size())) {
+        cout << "Invalid choice!" << endl;
+        return;
+    }
+    int courseId = courseIds[choice - 1];
+
+    // Get students in this course/department
+    string sql = "SELECT users.id, users.name FROM users "
+        "JOIN students ON users.id = students.user_id "
+        "JOIN departments ON students.department_id = departments.id "
+        "JOIN courses ON courses.department_id = departments.id "
+        "WHERE courses.id = " + to_string(courseId) + ";";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    vector<pair<int, string>> students;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int sid = sqlite3_column_int(stmt, 0);
+        string sname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        students.push_back({ sid, sname });
+    }
+    sqlite3_finalize(stmt);
+
+    if (students.empty()) {
+        cout << "No students found for this course!" << endl;
+        return;
+    }
+
+    time_t now = time(nullptr);
+    char date[11];
+    struct tm timeinfo;
+#if defined(_WIN32) || defined(_WIN64)
+    localtime_s(&timeinfo, &now);
+#else
+    localtime_r(&now, &timeinfo);
+#endif
+    strftime(date, sizeof(date), "%Y-%m-%d", &timeinfo);
+
+    cout << "\nEnter attendance for " << date << ":\n";
+    for (auto& student : students) {
+        char status;
+        cout << student.second << " (p/a): ";
+        cin >> status;
+        status = tolower(status);
+
+        if (status == 'p' || status == 'a') {
+            string statusStr = (status == 'p') ? "present" : "absent";
+            string insertSql = "INSERT INTO attendance (student_id, course_id, date, status) "
+                "VALUES (" + to_string(student.first) + ", " + to_string(courseId) + ", '"
+                + string(date) + "', '" + statusStr + "');";
+            executeSQL(insertSql.c_str());
+        }
+    }
+    cout << "Attendance recorded successfully!" << endl;
+}
+
+void Professor::addGrades() {
+    if (courseIds.empty()) {
+        cout << "You have no courses assigned!" << endl;
+        return;
+    }
+
+    cout << "\n=== Add Grades ===\n";
+    cout << "Select course:\n";
+    for (size_t i = 0; i < courseIds.size(); ++i) {
+        string sql = "SELECT name, course_type FROM courses WHERE id = " + to_string(courseIds[i]) + ";";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            cout << i + 1 << ". " << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))
+                << " (" << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)) << ")" << endl;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    int choice;
+    cout << "Enter choice: ";
+    cin >> choice;
+    if (choice < 1 || choice > static_cast<int>(courseIds.size())) {
+        cout << "Invalid choice!" << endl;
+        return;
+    }
+    int courseId = courseIds[choice - 1];
+
+    // Get course type
+    string courseType;
+    string typeSql = "SELECT course_type FROM courses WHERE id = " + to_string(courseId) + ";";
+    sqlite3_stmt* typeStmt;
+    if (sqlite3_prepare_v2(db, typeSql.c_str(), -1, &typeStmt, 0) == SQLITE_OK && sqlite3_step(typeStmt) == SQLITE_ROW) {
+        courseType = reinterpret_cast<const char*>(sqlite3_column_text(typeStmt, 0));
+    }
+    sqlite3_finalize(typeStmt);
+
+    // Get students
+    string sql = "SELECT users.id, users.name FROM users "
+        "JOIN students ON users.id = students.user_id "
+        "JOIN departments ON students.department_id = departments.id "
+        "JOIN courses ON courses.department_id = departments.id "
+        "WHERE courses.id = " + to_string(courseId) + ";";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    vector<pair<int, string>> students;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int sid = sqlite3_column_int(stmt, 0);
+        string sname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        students.push_back({ sid, sname });
+    }
+    sqlite3_finalize(stmt);
+
+    if (students.empty()) {
+        cout << "No students found for this course!" << endl;
+        return;
+    }
+
+    cout << "\nEnter grades for course (" << courseType << "):\n";
+    for (auto& student : students) {
+        cout << "\nStudent: " << student.second << endl;
+        double ass1, ass2, cw, final;
+
+        cout << "Assignment 1 (20%): ";
+        cin >> ass1;
+        cout << "Assignment 2 (30%): ";
+        cin >> ass2;
+        cout << "Coursework (20%): ";
+        cin >> cw;
+
+        if (courseType == "theoretical") {
+            final = 0; // Not used for theoretical
+            cout << "Final Exam (60%): ";
+            cin >> final;
+        }
+        else {
+            cout << "Final Exam (30%): ";
+            cin >> final;
+        }
+
+        // Calculate total
+        double total;
+        if (courseType == "theoretical") {
+            total = (ass1 * 0.2) + (ass2 * 0.2) + (final * 0.6);
+        }
+        else {
+            total = (ass1 * 0.2) + (ass2 * 0.3) + (cw * 0.2) + (final * 0.3);
+        }
+
+        // Determine grade letter
+        string grade;
+        if (total >= 85) grade = "Excellent";
+        else if (total >= 75) grade = "Very Good";
+        else if (total >= 65) grade = "Good";
+        else if (total >= 60) grade = "Pass";
+        else grade = "Fail";
+
+        // Check if grade exists
+        string checkSql = "SELECT id FROM grades WHERE student_id = " + to_string(student.first)
+            + " AND course_id = " + to_string(courseId) + ";";
+        sqlite3_stmt* checkStmt;
+        bool exists = false;
+        if (sqlite3_prepare_v2(db, checkSql.c_str(), -1, &checkStmt, 0) == SQLITE_OK && sqlite3_step(checkStmt) == SQLITE_ROW) {
+            exists = true;
+        }
+        sqlite3_finalize(checkStmt);
+
+        if (exists) {
+            string updateSql = "UPDATE grades SET assignment1 = " + to_string(ass1) +
+                ", assignment2 = " + to_string(ass2) +
+                ", coursework = " + to_string(cw) +
+                ", final_exam = " + to_string(final) +
+                ", total = " + to_string(total) +
+                ", grade_letter = '" + grade + "' " +
+                "WHERE student_id = " + to_string(student.first) +
+                " AND course_id = " + to_string(courseId) + ";";
+            executeSQL(updateSql.c_str());
+        }
+        else {
+            string insertSql = "INSERT INTO grades (student_id, course_id, assignment1, assignment2, coursework, final_exam, total, grade_letter) "
+                "VALUES (" + to_string(student.first) + ", " + to_string(courseId) + ", "
+                + to_string(ass1) + ", " + to_string(ass2) + ", " + to_string(cw) + ", "
+                + to_string(final) + ", " + to_string(total) + ", '" + grade + "');";
+            executeSQL(insertSql.c_str());
+        }
+    }
+    cout << "Grades recorded successfully!" << endl;
+}
+
+void Professor::showStudents() {
+    if (courseIds.empty()) {
+        cout << "You have no courses assigned!" << endl;
+        return;
+    }
+
+    cout << "\n=== Students in Your Courses ===\n";
+    cout << "Select course:\n";
+    for (size_t i = 0; i < courseIds.size(); ++i) {
+        string sql = "SELECT name FROM courses WHERE id = " + to_string(courseIds[i]) + ";";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            cout << i + 1 << ". " << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)) << endl;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    int choice;
+    cout << "Enter choice: ";
+    cin >> choice;
+    if (choice < 1 || choice > static_cast<int>(courseIds.size())) {
+        cout << "Invalid choice!" << endl;
+        return;
+    }
+    int courseId = courseIds[choice - 1];
+
+    string sql = "SELECT users.name, students.user_id FROM users "
+        "JOIN students ON users.id = students.user_id "
+        "JOIN departments ON students.department_id = departments.id "
+        "JOIN courses ON courses.department_id = departments.id "
+        "WHERE courses.id = " + to_string(courseId) + ";";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << "\nStudents enrolled:\n";
+    cout << left << setw(20) << "Name" << "Student ID" << endl;
+    cout << string(30, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string sname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        int sid = sqlite3_column_int(stmt, 1);
+        cout << left << setw(20) << sname << sid << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Professor::displayMenu() {
+    int choice;
+    while (true) {
+        cout << "\n=== Professor Menu ===\n";
+        cout << "1. View Profile\n";
+        cout << "2. Add Attendance\n";
+        cout << "3. Add Grades\n";
+        cout << "4. Show Students\n";
+        cout << "5. Logout\n";
+        cout << "Enter choice: ";
+        cin >> choice;
+
+        switch (choice) {
+        case 1: viewProfile(); break;
+        case 2: addAttendance(); break;
+        case 3: addGrades(); break;
+        case 4: showStudents(); break;
+        case 5: return;
+        default: cout << "Invalid choice!" << endl;
+        }
+    }
+}
+
+// Admin member functions
+void Admin::manageUsers() {
+    int choice;
+    while (true) {
+        cout << "\n=== User Management ===\n";
+        cout << "1. Add Student\n";
+        cout << "2. Add Professor\n";
+        cout << "3. Back\n";
+        cout << "Enter choice: ";
+        cin >> choice;
+
+        if (choice == 3) break;
+
+        string username, password, name, email;
+        cout << "Username: ";
+        cin >> username;
+        cout << "Password: ";
+        cin >> password;
+        cout << "Full Name: ";
+        cin.ignore();
+        getline(cin, name);
+        cout << "Email: ";
+        cin >> email;
+
+        if (choice == 1) {
+            // Get department ID
+            cout << "\nAvailable Departments:\n";
+            string deptSql = "SELECT id, name FROM departments;";
+            sqlite3_stmt* deptStmt;
+            if (sqlite3_prepare_v2(db, deptSql.c_str(), -1, &deptStmt, 0) == SQLITE_OK) {
+                while (sqlite3_step(deptStmt) == SQLITE_ROW) {
+                    int did = sqlite3_column_int(deptStmt, 0);
+                    string dname = reinterpret_cast<const char*>(sqlite3_column_text(deptStmt, 1));
+                    cout << did << ". " << dname << endl;
+                }
+            }
+            sqlite3_finalize(deptStmt);
+
+            cout << "Department ID: ";
+            int deptId;
+            cin >> deptId;
+
+            // Check if department exists
+            string checkDeptSql = "SELECT COUNT(*) FROM departments WHERE id = " + to_string(deptId) + ";";
+            sqlite3_stmt* checkStmt;
+            bool validDept = false;
+            if (sqlite3_prepare_v2(db, checkDeptSql.c_str(), -1, &checkStmt, 0) == SQLITE_OK && sqlite3_step(checkStmt) == SQLITE_ROW) {
+                validDept = (sqlite3_column_int(checkStmt, 0) > 0);
+            }
+            sqlite3_finalize(checkStmt);
+
+            if (!validDept) {
+                cout << "Invalid department ID!" << endl;
+                continue;
+            }
+
+            string sql = "INSERT INTO users (username, password, name, email, role, department_id) "
+                "VALUES ('" + username + "', '" + password + "', '" + name + "', '"
+                + email + "', 'student', " + to_string(deptId) + ");";
+            if (executeSQL(sql.c_str())) {
+                // Get the new user ID
+                string idSql = "SELECT last_insert_rowid();";
+                sqlite3_stmt* stmt;
+                if (sqlite3_prepare_v2(db, idSql.c_str(), -1, &stmt, 0) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+                    int userId = sqlite3_column_int(stmt, 0);
+                    string studentSql = "INSERT INTO students (user_id, department_id, fees_due, fees_paid) "
+                        "VALUES (" + to_string(userId) + ", " + to_string(deptId) + ", 5000.0, 0.0);";
+                    executeSQL(studentSql.c_str());
+                }
+                sqlite3_finalize(stmt);
+                cout << "Student created successfully!" << endl;
+            }
+        }
+        else if (choice == 2) {
+            string sql = "INSERT INTO users (username, password, name, email, role) "
+                "VALUES ('" + username + "', '" + password + "', '" + name + "', '"
+                + email + "', 'professor');";
+            if (executeSQL(sql.c_str())) {
+                cout << "Professor created successfully!" << endl;
+            }
+        }
+    }
+}
+
+void Admin::listUsers() {
+    int choice;
+    cout << "\n=== List Users ===\n";
+    cout << "1. All Users\n";
+    cout << "2. Students Only\n";
+    cout << "3. Professors Only\n";
+    cout << "Enter choice: ";
+    cin >> choice;
+
+    string sql;
+    if (choice == 1) {
+        sql = "SELECT id, username, name, role FROM users;";
+    }
+    else if (choice == 2) {
+        sql = "SELECT users.id, users.username, users.name, users.role "
+            "FROM users JOIN students ON users.id = students.user_id;";
+    }
+    else if (choice == 3) {
+        sql = "SELECT id, username, name, role FROM users WHERE role = 'professor';";
+    }
+    else {
+        cout << "Invalid choice!" << endl;
+        return;
+    }
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << "\nUser List:\n";
+    cout << left << setw(5) << "ID" << setw(15) << "Username" << setw(25) << "Name" << setw(10) << "Role" << endl;
+    cout << string(60, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt, 0);
+        string username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        string role = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        cout << left << setw(5) << id << setw(15) << username << setw(25) << name << setw(10) << role << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Admin::addDepartment() {
+    string name;
+    cout << "\n=== Add Department ===\n";
+    cout << "Department Name: ";
+    cin.ignore();
+    getline(cin, name);
+
+    string sql = "INSERT INTO departments (name) VALUES ('" + name + "');";
+    if (executeSQL(sql.c_str())) {
+        cout << "Department added successfully!" << endl;
+    }
+}
+
+void Admin::showGrades() {
+    cout << "\n=== All Grades ===\n";
+    string sql = "SELECT users.name, courses.name, grades.assignment1, grades.assignment2, "
+        "grades.coursework, grades.final_exam, grades.total, grades.grade_letter "
+        "FROM grades "
+        "JOIN users ON grades.student_id = users.id "
+        "JOIN courses ON grades.course_id = courses.id;";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << left << setw(15) << "Student" << setw(15) << "Course" << setw(10) << "Ass1" << setw(10) << "Ass2"
+        << setw(10) << "CW" << setw(10) << "Final" << setw(10) << "Total" << setw(10) << "Grade" << endl;
+    cout << string(95, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string student = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        string course = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        double ass1 = sqlite3_column_double(stmt, 2);
+        double ass2 = sqlite3_column_double(stmt, 3);
+        double cw = sqlite3_column_double(stmt, 4);
+        double final = sqlite3_column_double(stmt, 5);
+        double total = sqlite3_column_double(stmt, 6);
+        string grade = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+
+        cout << left << setw(15) << student
+            << setw(15) << course
+            << setw(10) << ass1
+            << setw(10) << ass2
+            << setw(10) << cw
+            << setw(10) << final
+            << setw(10) << total
+            << setw(10) << grade << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Admin::showAttendance() {
+    cout << "\n=== All Attendance ===\n";
+    string sql = "SELECT users.name, courses.name, attendance.date, attendance.status "
+        "FROM attendance "
+        "JOIN users ON attendance.student_id = users.id "
+        "JOIN courses ON attendance.course_id = courses.id;";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    cout << left << setw(20) << "Student" << setw(20) << "Course" << setw(15) << "Date" << setw(10) << "Status" << endl;
+    cout << string(70, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string student = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        string course = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        string date = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        string status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        cout << left << setw(20) << student << setw(20) << course << setw(15) << date << setw(10) << status << endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+void Admin::addCourse() {
+    cout << "\n=== Add Course ===\n";
+
+    // List departments
+    string deptSql = "SELECT id, name FROM departments;";
+    sqlite3_stmt* deptStmt;
+    vector<pair<int, string>> departments;
+
+    if (sqlite3_prepare_v2(db, deptSql.c_str(), -1, &deptStmt, 0) == SQLITE_OK) {
+        while (sqlite3_step(deptStmt) == SQLITE_ROW) {
+            int id = sqlite3_column_int(deptStmt, 0);
+            string name = reinterpret_cast<const char*>(sqlite3_column_text(deptStmt, 1));
+            departments.push_back({ id, name });
+            cout << id << ". " << name << endl;
+        }
+    }
+    sqlite3_finalize(deptStmt);
+
+    if (departments.empty()) {
+        cout << "No departments found! Add departments first." << endl;
+        return;
+    }
+
+    int deptId;
+    cout << "Select Department ID: ";
+    cin >> deptId;
+
+    string name, courseType;
+    cout << "Course Name: ";
+    cin.ignore();
+    getline(cin, name);
+
+    cout << "Course Type (theoretical/practical): ";
+    cin >> courseType;
+    if (courseType != "theoretical" && courseType != "practical") {
+        cout << "Invalid course type! Must be 'theoretical' or 'practical'" << endl;
+        return;
+    }
+
+    string sql = "INSERT INTO courses (name, department_id, course_type) "
+        "VALUES ('" + name + "', " + to_string(deptId) + ", '" + courseType + "');";
+    if (executeSQL(sql.c_str())) {
+        cout << "Course added successfully!" << endl;
+    }
+}
+
+void Admin::assignProfessor() {
+    cout << "\n=== Assign Professor ===\n";
+
+    // List professors
+    string profSql = "SELECT id, name FROM users WHERE role = 'professor';";
+    sqlite3_stmt* profStmt;
+    vector<pair<int, string>> professors;
+
+    if (sqlite3_prepare_v2(db, profSql.c_str(), -1, &profStmt, 0) == SQLITE_OK) {
+        while (sqlite3_step(profStmt) == SQLITE_ROW) {
+            int id = sqlite3_column_int(profStmt, 0);
+            string name = reinterpret_cast<const char*>(sqlite3_column_text(profStmt, 1));
+            professors.push_back({ id, name });
+            cout << id << ". " << name << endl;
+        }
+    }
+    sqlite3_finalize(profStmt);
+
+    if (professors.empty()) {
+        cout << "No professors found!" << endl;
+        return;
+    }
+
+    int profId;
+    cout << "Select Professor ID: ";
+    cin >> profId;
+
+    // List departments
+    string deptSql = "SELECT id, name FROM departments;";
+    sqlite3_stmt* deptStmt;
+    vector<pair<int, string>> departments;
+
+    if (sqlite3_prepare_v2(db, deptSql.c_str(), -1, &deptStmt, 0) == SQLITE_OK) {
+        while (sqlite3_step(deptStmt) == SQLITE_ROW) {
+            int id = sqlite3_column_int(deptStmt, 0);
+            string name = reinterpret_cast<const char*>(sqlite3_column_text(deptStmt, 1));
+            departments.push_back({ id, name });
+            cout << id << ". " << name << endl;
+        }
+    }
+    sqlite3_finalize(deptStmt);
+
+    if (departments.empty()) {
+        cout << "No departments found!" << endl;
+        return;
+    }
+
+    int deptId;
+    cout << "Select Department ID: ";
+    cin >> deptId;
+
+    // Assign to department
+    string deptAssignSql = "INSERT OR IGNORE INTO professor_departments (professor_id, department_id) "
+        "VALUES (" + to_string(profId) + ", " + to_string(deptId) + ");";
+    executeSQL(deptAssignSql.c_str());
+
+    // List courses in department
+    string courseSql = "SELECT id, name FROM courses WHERE department_id = " + to_string(deptId) + ";";
+    sqlite3_stmt* courseStmt;
+    vector<pair<int, string>> courses;
+
+    if (sqlite3_prepare_v2(db, courseSql.c_str(), -1, &courseStmt, 0) == SQLITE_OK) {
+        while (sqlite3_step(courseStmt) == SQLITE_ROW) {
+            int id = sqlite3_column_int(courseStmt, 0);
+            string name = reinterpret_cast<const char*>(sqlite3_column_text(courseStmt, 1));
+            courses.push_back({ id, name });
+            cout << id << ". " << name << endl;
+        }
+    }
+    sqlite3_finalize(courseStmt);
+
+    if (courses.empty()) {
+        cout << "No courses found in this department!" << endl;
+        return;
+    }
+
+    int courseId;
+    cout << "Select Course ID: ";
+    cin >> courseId;
+
+    // Assign to course
+    string courseAssignSql = "INSERT OR IGNORE INTO professor_courses (professor_id, course_id) "
+        "VALUES (" + to_string(profId) + ", " + to_string(courseId) + ");";
+    if (executeSQL(courseAssignSql.c_str())) {
+        cout << "Professor assigned successfully!" << endl;
+    }
+}
+
+void Admin::manageFees() {
+    cout << "\n=== Manage Student Fees ===\n";
+
+    // List students
+    string sql = "SELECT users.id, users.name, students.fees_due, students.fees_paid "
+        "FROM users JOIN students ON users.id = students.user_id;";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK) {
+        cerr << "Error: " << sqlite3_errmsg(db) << endl;
+        return;
+    }
+
+    vector<pair<int, pair<double, double>>> students; // id -> (due, paid)
+    cout << left << setw(5) << "ID" << setw(25) << "Name" << setw(12) << "Due" << setw(12) << "Paid" << endl;
+    cout << string(55, '-') << endl;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt, 0);
+        string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        double due = sqlite3_column_double(stmt, 2);
+        double paid = sqlite3_column_double(stmt, 3);
+        students.push_back({ id, {due, paid} });
+        cout << left << setw(5) << id << setw(25) << name
+            << setw(12) << fixed << setprecision(2) << due
+            << setw(12) << paid << endl;
+    }
+    sqlite3_finalize(stmt);
+
+    if (students.empty()) {
+        cout << "No students found!" << endl;
+        return;
+    }
+
+    int studentId;
+    double amount;
+    cout << "Enter Student ID to update fees: ";
+    cin >> studentId;
+    cout << "Enter payment amount: ";
+    cin >> amount;
+
+    auto it = find_if(students.begin(), students.end(),
+        [studentId](const pair<int, pair<double, double>>& s) { return s.first == studentId; });
+
+    if (it == students.end()) {
+        cout << "Invalid student ID!" << endl;
+        return;
+    }
+
+    double newPaid = it->second.second + amount;
+    double due = it->second.first;
+
+    if (newPaid > due) {
+        cout << "Payment exceeds due amount! Maximum payable: $" << (due - it->second.second) << endl;
+        return;
+    }
+
+    string updateSql = "UPDATE students SET fees_paid = " + to_string(newPaid) +
+        " WHERE user_id = " + to_string(studentId) + ";";
+    if (executeSQL(updateSql.c_str())) {
+        cout << "Fees updated successfully!" << endl;
+    }
+}
+
+void Admin::displayMenu() {
+    int choice;
+    while (true) {
+        cout << "\n=== Admin Menu ===\n";
+        cout << "1. Manage Users\n";
+        cout << "2. List Users\n";
+        cout << "3. Add Department\n";
+        cout << "4. Show All Grades\n";
+        cout << "5. Show All Attendance\n";
+        cout << "6. Add Course\n";
+        cout << "7. Assign Professor\n";
+        cout << "8. Manage Student Fees\n";
+        cout << "9. Logout\n";
+        cout << "Enter choice: ";
+        cin >> choice;
+
+        switch (choice) {
+        case 1: manageUsers(); break;
+        case 2: listUsers(); break;
+        case 3: addDepartment(); break;
+        case 4: showGrades(); break;
+        case 5: showAttendance(); break;
+        case 6: addCourse(); break;
+        case 7: assignProfessor(); break;
+        case 8: manageFees(); break;
+        case 9: return;
+        default: cout << "Invalid choice!" << endl;
+        }
+    }
+}
+
+// Initialize database schema
+void initializeDatabase() {
+    // Enable foreign keys
+    executeSQL("PRAGMA foreign_keys = ON;");
+
+    // Create tables
+    executeSQL("CREATE TABLE IF NOT EXISTS departments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "name TEXT NOT NULL UNIQUE);");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS users ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "username TEXT NOT NULL UNIQUE,"
+        "password TEXT NOT NULL,"
+        "name TEXT NOT NULL,"
+        "email TEXT NOT NULL,"
+        "role TEXT NOT NULL CHECK(role IN ('admin', 'professor', 'student')),"
+        "department_id INTEGER REFERENCES departments(id));");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS students ("
+        "user_id INTEGER PRIMARY KEY REFERENCES users(id),"
+        "department_id INTEGER REFERENCES departments(id),"
+        "fees_due REAL DEFAULT 5000.0,"
+        "fees_paid REAL DEFAULT 0.0);");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS professor_departments ("
+        "professor_id INTEGER REFERENCES users(id),"
+        "department_id INTEGER REFERENCES departments(id),"
+        "PRIMARY KEY (professor_id, department_id));");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS courses ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "name TEXT NOT NULL,"
+        "department_id INTEGER REFERENCES departments(id),"
+        "course_type TEXT NOT NULL CHECK(course_type IN ('theoretical', 'practical')));");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS professor_courses ("
+        "professor_id INTEGER REFERENCES users(id),"
+        "course_id INTEGER REFERENCES courses(id),"
+        "PRIMARY KEY (professor_id, course_id));");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS grades ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "student_id INTEGER REFERENCES users(id),"
+        "course_id INTEGER REFERENCES courses(id),"
+        "assignment1 REAL DEFAULT 0,"
+        "assignment2 REAL DEFAULT 0,"
+        "coursework REAL DEFAULT 0,"
+        "final_exam REAL DEFAULT 0,"
+        "total REAL DEFAULT 0,"
+        "grade_letter TEXT,"
+        "UNIQUE(student_id, course_id));");
+
+    executeSQL("CREATE TABLE IF NOT EXISTS attendance ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "student_id INTEGER REFERENCES users(id),"
+        "course_id INTEGER REFERENCES courses(id),"
+        "date TEXT NOT NULL,"
+        "status TEXT NOT NULL CHECK(status IN ('present', 'absent')));");
+
+    // Create default admin if not exists
+    executeSQL("INSERT OR IGNORE INTO users (username, password, name, email, role) "
+        "VALUES ('admin', 'admin123', 'System Admin', 'admin@university.com', 'admin');");
+}
+
+int main() {
+    // Open database connection
+    if (sqlite3_open("university.db", &db)) {
+        cerr << "Can't open database: " << sqlite3_errmsg(db) << endl;
         return 1;
     }
+
+    // Initialize database schema
+    initializeDatabase();
+
+    cout << "University Management System\n";
+    cout << "---------------------------\n";
+
+    while (true) {
+        User* currentUser = login();
+        if (!currentUser) continue;
+
+        currentUser->displayMenu();
+        delete currentUser;
+    }
+
+    sqlite3_close(db);
     return 0;
 }
